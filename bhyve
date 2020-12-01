@@ -1,0 +1,1209 @@
+#!/bin/sh
+# VNC Port
+vnc=$(netstat -aln | awk '
+  $6 == "LISTEN" {
+    if ($4 ~ "[.:][0-9]+$") {
+      split($4, a, /[:.]/);
+      port = a[length(a)];
+      p[port] = 1
+    }
+  }
+  END {
+    for (i = 5900; i < 5999 && p[i]; i++){};
+    if (i == 5999) {exit 1};
+    print i
+  }
+')
+
+Setup()
+{
+  # Determine interface automatically
+  NIC="$(ifconfig -l | awk '{print $1}')"
+
+  # Enabling the Bridge
+  Bridge="$(ifconfig bridge create)"
+
+  # Next, add the local interface as member of the bridge.
+  # for the bridge to forward packets,
+  # all member interfaces and the bridge need to be up:
+  ifconfig ${Bridge} addm ${NIC} up
+
+  # In order to configure the system to start bhyve guests at boot time,
+  # the following configurations must be made in the specified files:
+
+  # /boot/loader.conf
+  sysrc -f /boot/loader.conf if_bridge_load="YES"
+  sysrc -f /boot/loader.conf if_tap_load="YES"
+  sysrc -f /boot/loader.conf vmm_load="YES"
+
+  # /etc/rc.conf
+  sysrc cloned_interfaces="${Bridge}"
+  sysrc ifconfig_${Bridge}="addm ${NIC}"
+
+  # /etc/sysctl.conf
+  echo 'net.link.tap.up_on_open="1"' >> /etc/sysctl.conf
+  echo 'net.link.bridge.ipfw="1"' >> /etc/sysctl.conf
+
+
+  kldload if_tap vmm
+  sysctl net.link.tap.up_on_open="1"
+  sysctl net.link.bridge.ipfw="1"
+
+  # Create a VMs dataset
+  zfs create -p zroot/VMs/ISOs
+  cp ./efi.fd /zroot/VMs
+  
+  # Create rc.d directroy
+  rcd="/usr/local/etc/rc.d"
+
+  if [ ! -d "${rcd}" ]; then
+    mkdir -p /usr/local/etc/rc.d
+  fi
+  
+  # Create a VMs startup script
+  touch /usr/local/etc/rc.d/bhyve
+  chmod +x,u=rx /usr/local/etc/rc.d/bhyve
+  printf "#!/bin/sh\n# PROVIDE: bhyve\n# REQUIRE: DAEMON\n# KEYWORD: shutdown\n. /etc/rc.subr\nname=bhyve\n" >> /usr/local/etc/rc.d/bhyve
+  printf 'start_cmd="${name}_start"\n' >> /usr/local/etc/rc.d/bhyve
+  printf "bhyve_start()\n{\n}\n" >> /usr/local/etc/rc.d/bhyve
+  printf 'load_rc_config ${name}\nrun_rc_command "$1"\n' >> /usr/local/etc/rc.d/bhyve
+  sysrc bhyve_enable="YES"
+}
+
+Clean()
+{
+  Bridge=$(sysrc cloned_interfaces | awk '{print $2}')
+  sysctl net.link.tap.up_on_open="0"
+  sysctl net.link.bridge.ipfw="0"
+  kldunload if_tap vmm
+  ifconfig ${Bridge} destroy
+
+  # /boot/loader.conf
+  sysrc -x -f /boot/loader.conf if_bridge_load
+  sysrc -x -f /boot/loader.conf if_tap_load
+  sysrc -x -f /boot/loader.conf vmm_load
+
+  # /etc/rc.conf
+  sysrc -x cloned_interfaces
+  sysrc -x ifconfig_${Bridge}
+
+  # /etc/sysctl.conf
+  sed -i '' 's/net.link.tap.up_on_open="1"//g' /etc/sysctl.conf
+  sed -i '' 's/net.link.bridge.ipfw="1"//g' /etc/sysctl.conf
+  sed -i '' '/^$/d' /etc/sysctl.conf
+
+  # Delete rc scripts
+  rm /usr/local/etc/rc.d/bhyve
+  sysrc -x bhyve_enable
+}
+
+FreeBSD()
+{
+  Bridge=$(sysrc cloned_interfaces | awk '{print $2}')
+
+  # Create a VM dataset
+  zfs create zroot/VMs/${name}
+
+  # Create a tap interface and make it member of the bridge
+  tap="$(ifconfig tap create)"
+  ifconfig ${Bridge} addm ${tap}
+
+  # To start tap interface at boot time
+  sysrc cloned_interfaces+="${tap}"
+  sysrc ifconfig_bridge0="$(sysrc ifconfig_bridge0 | awk '{ for(i=2; i<=NF; i++) printf "%s",$i (i==NF?ORS:OFS) }') addm ${tap}"
+
+  # Create ZFS volume
+  zfs create -V${disk}G -o volmode=dev zroot/VMs/${name}/disk0
+
+  Installation()
+  {
+    bhyve -Hw -c ${cpu} -m ${ram}G \
+      -s 0,hostbridge \
+      -s 1,virtio-net,${tap} \
+      -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+      -s 3,ahci-cd,${FreeBSD_ISO} \
+      -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768,wait \
+      -s 30,xhci,tablet \
+      -s 31,lpc \
+      -l bootrom,/zroot/VMs/efi.fd \
+      ${name}
+  } 
+  Starting()
+  {
+    bhyve -Hw -c ${cpu} -m ${ram}G \
+      -s 0,hostbridge \
+      -s 1,virtio-net,${tap} \
+      -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+      -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768 \
+      -s 30,xhci,tablet \
+      -s 31,lpc \
+      -l bootrom,/zroot/VMs/efi.fd \
+      ${name}
+  }   
+  # Start the installation
+  Installation &&
+  # Starting the loop after completion of the installation
+  while true; do
+    Starting;
+    es=$?
+    if [ ${es} -ne 0 ]; then
+    break;
+    fi
+  done > /dev/null 2>&1 &
+  
+  touch /usr/local/etc/rc.d/${name}
+  chmod +x,u=rx /usr/local/etc/rc.d/${name}
+  printf "#!/bin/sh\n. /etc/rc.subr\n" >> /usr/local/etc/rc.d/${name}
+  sed -n '3,16p' ./bhyve >>  /usr/local/etc/rc.d/${name}
+  printf "cpu=${cpu}\nram=${ram}G\ntap=${tap}\nname=${name}\n" >> /usr/local/etc/rc.d/${name}
+  printf 'start_cmd="${name}_start"
+  stop_cmd="${name}_stop"
+  restart_cmd="${name}_restart"
+  delete_cmd="${name}_delete"\n' | sed -e 's/^[ \t]*//' >> /usr/local/etc/rc.d/${name}
+  printf "${name}_start()\n" >> /usr/local/etc/rc.d/${name}
+  echo ' {
+    while true; do
+      bhyve -Hw -c ${cpu} -m ${ram}G \
+        -s 0,hostbridge \
+        -s 1,virtio-net,${tap} \
+        -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+        -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768 \
+        -s 30,xhci,tablet \
+        -s 31,lpc \
+        -l bootrom,/zroot/VMs/efi.fd \
+        ${name}
+      es=$?
+      if [ ${es} -ne 0 ]; then
+        break;
+      fi
+    done > /dev/null 2>&1 &
+  }' >> /usr/local/etc/rc.d/${name}
+  printf "${name}_stop()
+  {
+    bhyvectl --vm=${name} --force-poweroff
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf "${name}_restart()
+  {
+    bhyvectl --vm=${name} --force-reset
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf "${name}_delete()
+  {
+    bhyvectl --vm=${name} --destroy
+    sleep 5
+    ifconfig ${tap} destroy
+    sysrc cloned_interfaces-=${tap}
+    sed -i '' 's/ addm ${tap}//g' /etc/rc.conf
+    sed -i '' 's/service ${name} start | sleep 5//g' /usr/local/etc/rc.d/bhyve
+    sed -i '' '/^$/d' /usr/local/etc/rc.d/bhyve
+    zfs destroy -r zroot/VMs/${name}
+    rm /usr/local/etc/rc.d/${name}
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf 'load_rc_config ${name}
+
+  run_rc_command "$1"\n' | sed -e 's/^[ \t]*//' >> /usr/local/etc/rc.d/${name}
+
+  # Add the VM to /usr/local/etc/rc.d/bhyve for autostart
+  sed -i '' -e "10s/^/service ${name} start | sleep 5\n/g"  /usr/local/etc/rc.d/bhyve
+}
+
+OpenBSD()
+{
+  Bridge=$(sysrc cloned_interfaces | awk '{print $2}')
+
+  # Create a VM dataset
+  zfs create zroot/VMs/${name}
+
+  # Create a tap interface and make it member of the bridge
+  tap="$(ifconfig tap create)"
+  ifconfig ${Bridge} addm ${tap}
+
+  # To start tap interface at boot time
+  sysrc cloned_interfaces+="${tap}"
+  sysrc ifconfig_bridge0="$(sysrc ifconfig_bridge0 | awk '{ for(i=2; i<=NF; i++) printf "%s",$i (i==NF?ORS:OFS) }') addm ${tap}"
+
+  # Create ZFS volume
+  zfs create -V${disk}G -o volmode=dev zroot/VMs/${name}/disk0
+
+  Installation()
+  {
+    bhyve -Hw -c ${cpu} -m ${ram}G \
+      -s 0,amd_hostbridge \
+      -s 1,virtio-net,${tap} \
+      -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+      -s 3,ahci-hd,${OpenBSD_ISO} \
+      -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768,vga=off,wait \
+      -s 30,xhci,tablet \
+      -s 31,lpc \
+      -l bootrom,/zroot/VMs/efi.fd \
+      ${name}
+  } 
+  Starting()
+  {
+    bhyve -Hw -c ${cpu} -m ${ram}G \
+      -s 0,amd_hostbridge \
+      -s 1,virtio-net,${tap} \
+      -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+      -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768,vga=off \
+      -s 30,xhci,tablet \
+      -s 31,lpc \
+      -l bootrom,/zroot/VMs/efi.fd \
+      ${name}
+  }   
+  # Start the installation
+  Installation &&
+  # Starting the loop after completion of the installation
+  while true; do
+    Starting;
+    es=$?
+    if [ ${es} -ne 0 ]; then
+    break;
+    fi
+  done > /dev/null 2>&1 &
+  
+  touch /usr/local/etc/rc.d/${name}
+  chmod +x,u=rx /usr/local/etc/rc.d/${name}
+  printf "#!/bin/sh\n. /etc/rc.subr\n" >> /usr/local/etc/rc.d/${name}
+  sed -n '3,16p' ./bhyve >>  /usr/local/etc/rc.d/${name}
+  printf "cpu=${cpu}\nram=${ram}G\ntap=${tap}\nname=${name}\n" >> /usr/local/etc/rc.d/${name}
+  printf 'start_cmd="${name}_start"
+  stop_cmd="${name}_stop"
+  restart_cmd="${name}_restart"
+  delete_cmd="${name}_delete"\n' | sed -e 's/^[ \t]*//' >> /usr/local/etc/rc.d/${name}
+  printf "${name}_start()\n" >> /usr/local/etc/rc.d/${name}
+  echo ' {
+    while true; do
+      bhyve -Hw -c ${cpu} -m ${ram}G \
+        -s 0,hostbridge \
+        -s 1,virtio-net,${tap} \
+        -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+        -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768 \
+        -s 30,xhci,tablet \
+        -s 31,lpc \
+        -l bootrom,/zroot/VMs/efi.fd \
+        ${name}
+      es=$?
+      if [ ${es} -ne 0 ]; then
+        break;
+      fi
+    done > /dev/null 2>&1 &
+  }' >> /usr/local/etc/rc.d/${name}
+  printf "${name}_stop()
+  {
+    bhyvectl --vm=${name} --force-poweroff
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf "${name}_restart()
+  {
+    bhyvectl --vm=${name} --force-reset
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf "${name}_delete()
+  {
+    bhyvectl --vm=${name} --destroy
+    sleep 5
+    ifconfig ${tap} destroy
+    sysrc cloned_interfaces-=${tap}
+    sed -i '' 's/ addm ${tap}//g' /etc/rc.conf
+    sed -i '' 's/service ${name} start | sleep 5//g' /usr/local/etc/rc.d/bhyve
+    sed -i '' '/^$/d' /usr/local/etc/rc.d/bhyve
+    zfs destroy -r zroot/VMs/${name}
+    rm /usr/local/etc/rc.d/${name}
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf 'load_rc_config ${name}
+
+  run_rc_command "$1"\n' | sed -e 's/^[ \t]*//' >> /usr/local/etc/rc.d/${name}
+
+  # Add the VM to /usr/local/etc/rc.d/bhyve for autostart
+  sed -i '' -e "10s/^/service ${name} start | sleep 5\n/g"  /usr/local/etc/rc.d/bhyve
+}
+
+Fedora()
+{
+  Bridge=$(sysrc cloned_interfaces | awk '{print $2}')
+
+  # Create a VM dataset
+  zfs create zroot/VMs/${name}
+
+  # Create a tap interface and make it member of the bridge
+  tap="$(ifconfig tap create)"
+  ifconfig ${Bridge} addm ${tap}
+
+  # To start tap interface at boot time
+  sysrc cloned_interfaces+="${tap}"
+  sysrc ifconfig_bridge0="$(sysrc ifconfig_bridge0 | awk '{ for(i=2; i<=NF; i++) printf "%s",$i (i==NF?ORS:OFS) }') addm ${tap}"
+
+  # Create ZFS volume
+  zfs create -V${disk}G -o volmode=dev zroot/VMs/${name}/disk0
+
+  Installation()
+  {
+    bhyve -Hw -c ${cpu} -m ${ram}G \
+      -s 0,hostbridge \
+      -s 1,virtio-net,${tap} \
+      -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+      -s 3,ahci-cd,${Fedora_ISO} \
+      -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768,wait \
+      -s 30,xhci,tablet \
+      -s 31,lpc \
+      -l bootrom,/zroot/VMs/efi.fd \
+      ${name}
+  } 
+  Starting()
+  {
+    bhyve -Hw -c ${cpu} -m ${ram}G \
+      -s 0,hostbridge \
+      -s 1,virtio-net,${tap} \
+      -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+      -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768 \
+      -s 30,xhci,tablet \
+      -s 31,lpc \
+      -l bootrom,/zroot/VMs/efi.fd \
+      ${name}
+  }   
+  # Start the installation
+  Installation &&
+  # Starting the loop after completion of the installation
+  while true; do
+    Starting;
+    es=$?
+    if [ ${es} -ne 0 ]; then
+    break;
+    fi
+  done > /dev/null 2>&1 &
+  
+  touch /usr/local/etc/rc.d/${name}
+  chmod +x,u=rx /usr/local/etc/rc.d/${name}
+  printf "#!/bin/sh\n. /etc/rc.subr\n" >> /usr/local/etc/rc.d/${name}
+  sed -n '3,16p' ./bhyve >>  /usr/local/etc/rc.d/${name}
+  printf "cpu=${cpu}\nram=${ram}G\ntap=${tap}\nname=${name}\n" >> /usr/local/etc/rc.d/${name}
+  printf 'start_cmd="${name}_start"
+  stop_cmd="${name}_stop"
+  restart_cmd="${name}_restart"
+  delete_cmd="${name}_delete"\n' | sed -e 's/^[ \t]*//' >> /usr/local/etc/rc.d/${name}
+  printf "${name}_start()\n" >> /usr/local/etc/rc.d/${name}
+  echo ' {
+    while true; do
+      bhyve -Hw -c ${cpu} -m ${ram}G \
+        -s 0,hostbridge \
+        -s 1,virtio-net,${tap} \
+        -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+        -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768 \
+        -s 30,xhci,tablet \
+        -s 31,lpc \
+        -l bootrom,/zroot/VMs/efi.fd \
+        ${name}
+      es=$?
+      if [ ${es} -ne 0 ]; then
+        break;
+      fi
+    done > /dev/null 2>&1 &
+  }' >> /usr/local/etc/rc.d/${name}
+  printf "${name}_stop()
+  {
+    bhyvectl --vm=${name} --force-poweroff
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf "${name}_restart()
+  {
+    bhyvectl --vm=${name} --force-reset
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf "${name}_delete()
+  {
+    bhyvectl --vm=${name} --destroy
+    sleep 5
+    ifconfig ${tap} destroy
+    sysrc cloned_interfaces-=${tap}
+    sed -i '' 's/ addm ${tap}//g' /etc/rc.conf
+    sed -i '' 's/service ${name} start | sleep 5//g' /usr/local/etc/rc.d/bhyve
+    sed -i '' '/^$/d' /usr/local/etc/rc.d/bhyve
+    zfs destroy -r zroot/VMs/${name}
+    rm /usr/local/etc/rc.d/${name}
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf 'load_rc_config ${name}
+
+  run_rc_command "$1"\n' | sed -e 's/^[ \t]*//' >> /usr/local/etc/rc.d/${name}
+
+  # Add the VM to /usr/local/etc/rc.d/bhyve for autostart
+  sed -i '' -e "10s/^/service ${name} start | sleep 5\n/g"  /usr/local/etc/rc.d/bhyve
+}
+
+CentOS()
+{
+  Bridge=$(sysrc cloned_interfaces | awk '{print $2}')
+
+  # Create a VM dataset
+  zfs create zroot/VMs/${name}
+
+  # Create a tap interface and make it member of the bridge
+  tap="$(ifconfig tap create)"
+  ifconfig ${Bridge} addm ${tap}
+
+  # To start tap interface at boot time
+  sysrc cloned_interfaces+="${tap}"
+  sysrc ifconfig_bridge0="$(sysrc ifconfig_bridge0 | awk '{ for(i=2; i<=NF; i++) printf "%s",$i (i==NF?ORS:OFS) }') addm ${tap}"
+
+  # Create ZFS volume
+  zfs create -V${disk}G -o volmode=dev zroot/VMs/${name}/disk0
+
+  Installation()
+  {
+    bhyve -Hw -c ${cpu} -m ${ram}G \
+      -s 0,hostbridge \
+      -s 1,virtio-net,${tap} \
+      -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+      -s 3,ahci-cd,${CentOS_ISO} \
+      -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768,wait \
+      -s 30,xhci,tablet \
+      -s 31,lpc \
+      -l bootrom,/zroot/VMs/efi.fd \
+      ${name}
+  } 
+  Starting()
+  {
+    bhyve -Hw -c ${cpu} -m ${ram}G \
+      -s 0,hostbridge \
+      -s 1,virtio-net,${tap} \
+      -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+      -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768 \
+      -s 30,xhci,tablet \
+      -s 31,lpc \
+      -l bootrom,/zroot/VMs/efi.fd \
+      ${name}
+  }   
+  # Start the installation
+  Installation &&
+  # Starting the loop after completion of the installation
+  while true; do
+    Starting;
+    es=$?
+    if [ ${es} -ne 0 ]; then
+    break;
+    fi
+  done > /dev/null 2>&1 &
+  
+  touch /usr/local/etc/rc.d/${name}
+  chmod +x,u=rx /usr/local/etc/rc.d/${name}
+  printf "#!/bin/sh\n. /etc/rc.subr\n" >> /usr/local/etc/rc.d/${name}
+  sed -n '3,16p' ./bhyve >>  /usr/local/etc/rc.d/${name}
+  printf "cpu=${cpu}\nram=${ram}G\ntap=${tap}\nname=${name}\n" >> /usr/local/etc/rc.d/${name}
+  printf 'start_cmd="${name}_start"
+  stop_cmd="${name}_stop"
+  restart_cmd="${name}_restart"
+  delete_cmd="${name}_delete"\n' | sed -e 's/^[ \t]*//' >> /usr/local/etc/rc.d/${name}
+  printf "${name}_start()\n" >> /usr/local/etc/rc.d/${name}
+  echo ' {
+    while true; do
+      bhyve -Hw -c ${cpu} -m ${ram}G \
+        -s 0,hostbridge \
+        -s 1,virtio-net,${tap} \
+        -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+        -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768 \
+        -s 30,xhci,tablet \
+        -s 31,lpc \
+        -l bootrom,/zroot/VMs/efi.fd \
+        ${name}
+      es=$?
+      if [ ${es} -ne 0 ]; then
+        break;
+      fi
+    done > /dev/null 2>&1 &
+  }' >> /usr/local/etc/rc.d/${name}
+  printf "${name}_stop()
+  {
+    bhyvectl --vm=${name} --force-poweroff
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf "${name}_restart()
+  {
+    bhyvectl --vm=${name} --force-reset
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf "${name}_delete()
+  {
+    bhyvectl --vm=${name} --destroy
+    sleep 5
+    ifconfig ${tap} destroy
+    sysrc cloned_interfaces-=${tap}
+    sed -i '' 's/ addm ${tap}//g' /etc/rc.conf
+    sed -i '' 's/service ${name} start | sleep 5//g' /usr/local/etc/rc.d/bhyve
+    sed -i '' '/^$/d' /usr/local/etc/rc.d/bhyve
+    zfs destroy -r zroot/VMs/${name}
+    rm /usr/local/etc/rc.d/${name}
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf 'load_rc_config ${name}
+
+  run_rc_command "$1"\n' | sed -e 's/^[ \t]*//' >> /usr/local/etc/rc.d/${name}
+
+  # Add the VM to /usr/local/etc/rc.d/bhyve for autostart
+  sed -i '' -e "10s/^/service ${name} start | sleep 5\n/g"  /usr/local/etc/rc.d/bhyve
+}
+
+openSUSE()
+{
+  Bridge=$(sysrc cloned_interfaces | awk '{print $2}')
+
+  # Create a VM dataset
+  zfs create zroot/VMs/${name}
+
+  # Create a tap interface and make it member of the bridge
+  tap="$(ifconfig tap create)"
+  ifconfig ${Bridge} addm ${tap}
+
+  # To start tap interface at boot time
+  sysrc cloned_interfaces+="${tap}"
+  sysrc ifconfig_bridge0="$(sysrc ifconfig_bridge0 | awk '{ for(i=2; i<=NF; i++) printf "%s",$i (i==NF?ORS:OFS) }') addm ${tap}"
+
+  # Create ZFS volume
+  zfs create -V${disk}G -o volmode=dev zroot/VMs/${name}/disk0
+
+  Installation()
+  {
+    bhyve -Hw -c ${cpu} -m ${ram}G \
+      -s 0,hostbridge \
+      -s 1,virtio-net,${tap} \
+      -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+      -s 3,ahci-cd,${openSUSE_ISO} \
+      -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768,wait \
+      -s 30,xhci,tablet \
+      -s 31,lpc \
+      -l bootrom,/zroot/VMs/efi.fd \
+      ${name}
+  } 
+  Starting()
+  {
+    bhyve -Hw -c ${cpu} -m ${ram}G \
+      -s 0,hostbridge \
+      -s 1,virtio-net,${tap} \
+      -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+      -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768 \
+      -s 30,xhci,tablet \
+      -s 31,lpc \
+      -l bootrom,/zroot/VMs/efi.fd \
+      ${name}
+  }   
+  # Start the installation
+  Installation &&
+  # Starting the loop after completion of the installation
+  while true; do
+    Starting;
+    es=$?
+    if [ ${es} -ne 0 ]; then
+    break;
+    fi
+  done > /dev/null 2>&1 &
+  
+  touch /usr/local/etc/rc.d/${name}
+  chmod +x,u=rx /usr/local/etc/rc.d/${name}
+  printf "#!/bin/sh\n. /etc/rc.subr\n" >> /usr/local/etc/rc.d/${name}
+  sed -n '3,16p' ./bhyve >>  /usr/local/etc/rc.d/${name}
+  printf "cpu=${cpu}\nram=${ram}G\ntap=${tap}\nname=${name}\n" >> /usr/local/etc/rc.d/${name}
+  printf 'start_cmd="${name}_start"
+  stop_cmd="${name}_stop"
+  restart_cmd="${name}_restart"
+  delete_cmd="${name}_delete"\n' | sed -e 's/^[ \t]*//' >> /usr/local/etc/rc.d/${name}
+  printf "${name}_start()\n" >> /usr/local/etc/rc.d/${name}
+  echo ' {
+    while true; do
+      bhyve -Hw -c ${cpu} -m ${ram}G \
+        -s 0,hostbridge \
+        -s 1,virtio-net,${tap} \
+        -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+        -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768 \
+        -s 30,xhci,tablet \
+        -s 31,lpc \
+        -l bootrom,/zroot/VMs/efi.fd \
+        ${name}
+      es=$?
+      if [ ${es} -ne 0 ]; then
+        break;
+      fi
+    done > /dev/null 2>&1 &
+  }' >> /usr/local/etc/rc.d/${name}
+  printf "${name}_stop()
+  {
+    bhyvectl --vm=${name} --force-poweroff
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf "${name}_restart()
+  {
+    bhyvectl --vm=${name} --force-reset
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf "${name}_delete()
+  {
+    bhyvectl --vm=${name} --destroy
+    sleep 5
+    ifconfig ${tap} destroy
+    sysrc cloned_interfaces-=${tap}
+    sed -i '' 's/ addm ${tap}//g' /etc/rc.conf
+    sed -i '' 's/service ${name} start | sleep 5//g' /usr/local/etc/rc.d/bhyve
+    sed -i '' '/^$/d' /usr/local/etc/rc.d/bhyve
+    zfs destroy -r zroot/VMs/${name}
+    rm /usr/local/etc/rc.d/${name}
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf 'load_rc_config ${name}
+
+  run_rc_command "$1"\n' | sed -e 's/^[ \t]*//' >> /usr/local/etc/rc.d/${name}
+
+  # Add the VM to /usr/local/etc/rc.d/bhyve for autostart
+  sed -i '' -e "10s/^/service ${name} start | sleep 5\n/g"  /usr/local/etc/rc.d/bhyve
+}
+
+MicroOS()
+{
+  Bridge=$(sysrc cloned_interfaces | awk '{print $2}')
+
+  # Create a VM dataset
+  zfs create zroot/VMs/${name}
+
+  # Create a tap interface and make it member of the bridge
+  tap="$(ifconfig tap create)"
+  ifconfig ${Bridge} addm ${tap}
+
+  # To start tap interface at boot time
+  sysrc cloned_interfaces+="${tap}"
+  sysrc ifconfig_bridge0="$(sysrc ifconfig_bridge0 | awk '{ for(i=2; i<=NF; i++) printf "%s",$i (i==NF?ORS:OFS) }') addm ${tap}"
+
+  # Create ZFS volume
+  zfs create -V${disk}G -o volmode=dev zroot/VMs/${name}/disk0
+
+  Installation()
+  {
+    bhyve -Hw -c ${cpu} -m ${ram}G \
+      -s 0,hostbridge \
+      -s 1,virtio-net,${tap} \
+      -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+      -s 3,ahci-cd,${MicroOS_ISO} \
+      -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768,wait \
+      -s 30,xhci,tablet \
+      -s 31,lpc \
+      -l bootrom,/zroot/VMs/efi.fd \
+      ${name}
+  } 
+  Starting()
+  {
+    bhyve -Hw -c ${cpu} -m ${ram}G \
+      -s 0,hostbridge \
+      -s 1,virtio-net,${tap} \
+      -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+      -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768 \
+      -s 30,xhci,tablet \
+      -s 31,lpc \
+      -l bootrom,/zroot/VMs/efi.fd \
+      ${name}
+  }   
+  # Start the installation
+  Installation &&
+  # Starting the loop after completion of the installation
+  while true; do
+    Starting;
+    es=$?
+    if [ ${es} -ne 0 ]; then
+    break;
+    fi
+  done > /dev/null 2>&1 &
+  
+  touch /usr/local/etc/rc.d/${name}
+  chmod +x,u=rx /usr/local/etc/rc.d/${name}
+  printf "#!/bin/sh\n. /etc/rc.subr\n" >> /usr/local/etc/rc.d/${name}
+  sed -n '3,16p' ./bhyve >>  /usr/local/etc/rc.d/${name}
+  printf "cpu=${cpu}\nram=${ram}G\ntap=${tap}\nname=${name}\n" >> /usr/local/etc/rc.d/${name}
+  printf 'start_cmd="${name}_start"
+  stop_cmd="${name}_stop"
+  restart_cmd="${name}_restart"
+  delete_cmd="${name}_delete"\n' | sed -e 's/^[ \t]*//' >> /usr/local/etc/rc.d/${name}
+  printf "${name}_start()\n" >> /usr/local/etc/rc.d/${name}
+  echo ' {
+    while true; do
+      bhyve -Hw -c ${cpu} -m ${ram}G \
+        -s 0,hostbridge \
+        -s 1,virtio-net,${tap} \
+        -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+        -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768 \
+        -s 30,xhci,tablet \
+        -s 31,lpc \
+        -l bootrom,/zroot/VMs/efi.fd \
+        ${name}
+      es=$?
+      if [ ${es} -ne 0 ]; then
+        break;
+      fi
+    done > /dev/null 2>&1 &
+  }' >> /usr/local/etc/rc.d/${name}
+  printf "${name}_stop()
+  {
+    bhyvectl --vm=${name} --force-poweroff
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf "${name}_restart()
+  {
+    bhyvectl --vm=${name} --force-reset
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf "${name}_delete()
+  {
+    bhyvectl --vm=${name} --destroy
+    sleep 5
+    ifconfig ${tap} destroy
+    sysrc cloned_interfaces-=${tap}
+    sed -i '' 's/ addm ${tap}//g' /etc/rc.conf
+    sed -i '' 's/service ${name} start | sleep 5//g' /usr/local/etc/rc.d/bhyve
+    sed -i '' '/^$/d' /usr/local/etc/rc.d/bhyve
+    zfs destroy -r zroot/VMs/${name}
+    rm /usr/local/etc/rc.d/${name}
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf 'load_rc_config ${name}
+
+  run_rc_command "$1"\n' | sed -e 's/^[ \t]*//' >> /usr/local/etc/rc.d/${name}
+
+  # Add the VM to /usr/local/etc/rc.d/bhyve for autostart
+  sed -i '' -e "10s/^/service ${name} start | sleep 5\n/g"  /usr/local/etc/rc.d/bhyve
+}
+
+Windows()
+{
+  Bridge=$(sysrc cloned_interfaces | awk '{print $2}')
+
+  # Create a VM dataset
+  zfs create zroot/VMs/${name}
+
+  # Create a tap interface and make it member of the bridge
+  tap="$(ifconfig tap create)"
+  ifconfig ${Bridge} addm ${tap}
+
+  # To start tap interface at boot time
+  sysrc cloned_interfaces+="${tap}"
+  sysrc ifconfig_bridge0="$(sysrc ifconfig_bridge0 | awk '{ for(i=2; i<=NF; i++) printf "%s",$i (i==NF?ORS:OFS) }') addm ${tap}"
+
+  # Create ZFS volume
+  zfs create -V${disk}G -o volmode=dev zroot/VMs/${name}/disk0
+
+  First_Installation()
+  {
+    bhyve -Hw -c ${cpu} -m ${ram}G \
+      -s 0,hostbridge \
+      -s 1,virtio-net,${tap} \
+      -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+      -s 3,ahci-cd,${Windows_ISO} \
+      -s 4,ahci-cd,${Virtio_ISO} \
+      -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768,wait \
+      -s 30,xhci,tablet \
+      -s 31,lpc \
+      -l bootrom,/zroot/VMs/efi.fd \
+      ${name}
+  } 
+  Second_Installation()
+  {
+    bhyve -Hw -c ${cpu} -m ${ram}G \
+      -s 0,hostbridge \
+      -s 1,virtio-net,${tap} \
+      -s 2,ahci-hd,/dev/zvol/zroot/VMs/${name}/disk0 \
+      -s 3,ahci-cd,${Windows_ISO} \
+      -s 4,ahci-cd,${Virtio_ISO} \
+      -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768 \
+      -s 30,xhci,tablet \
+      -s 31,lpc \
+      -l bootrom,/zroot/VMs/efi.fd \
+      ${name}
+  }
+  Third_Installation()
+  {
+    bhyve -Hw -c ${cpu} -m ${ram}G \
+      -s 0,hostbridge \
+      -s 1,virtio-net,${tap} \
+      -s 2,ahci-hd,/dev/zvol/zroot/VMs/${name}/disk0 \
+      -s 3,ahci-cd,${Windows_ISO} \
+      -s 4,ahci-cd,${Virtio_ISO} \
+      -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768 \
+      -s 30,xhci,tablet \
+      -s 31,lpc \
+      -l bootrom,/zroot/VMs/efi.fd \
+      ${name}
+  }
+  Starting()
+  {
+    bhyve -Hw -c ${cpu} -m ${ram}G \
+      -s 0,hostbridge \
+      -s 1,virtio-net,${tap} \
+      -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+      -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768 \
+      -s 30,xhci,tablet \
+      -s 31,lpc \
+      -l bootrom,/zroot/VMs/efi.fd \
+      ${name}
+  }   
+  # Start the installation
+  First_Installation && Second_Installation && Third_Installation &&
+  # Starting the loop after completion of the installation
+  while true; do
+    Starting;
+    es=$?
+    if [ ${es} -ne 0 ]; then
+    break;
+    fi
+  done > /dev/null 2>&1 &
+  
+  touch /usr/local/etc/rc.d/${name}
+  chmod +x,u=rx /usr/local/etc/rc.d/${name}
+  printf "#!/bin/sh\n. /etc/rc.subr\n" >> /usr/local/etc/rc.d/${name}
+  sed -n '3,16p' ./bhyve >>  /usr/local/etc/rc.d/${name}
+  printf "cpu=${cpu}\nram=${ram}G\ntap=${tap}\nname=${name}\n" >> /usr/local/etc/rc.d/${name}
+  printf 'start_cmd="${name}_start"
+  stop_cmd="${name}_stop"
+  restart_cmd="${name}_restart"
+  delete_cmd="${name}_delete"\n' | sed -e 's/^[ \t]*//' >> /usr/local/etc/rc.d/${name}
+  printf "${name}_start()\n" >> /usr/local/etc/rc.d/${name}
+  echo ' {
+    while true; do
+      bhyve -Hw -c ${cpu} -m ${ram}G \
+        -s 0,hostbridge \
+        -s 1,virtio-net,${tap} \
+        -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+        -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768 \
+        -s 30,xhci,tablet \
+        -s 31,lpc \
+        -l bootrom,/zroot/VMs/efi.fd \
+        ${name}
+      es=$?
+      if [ ${es} -ne 0 ]; then
+        break;
+      fi
+    done > /dev/null 2>&1 &
+  }' >> /usr/local/etc/rc.d/${name}
+  printf "${name}_stop()
+  {
+    bhyvectl --vm=${name} --force-poweroff
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf "${name}_restart()
+  {
+    bhyvectl --vm=${name} --force-reset
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf "${name}_delete()
+  {
+    bhyvectl --vm=${name} --destroy
+    sleep 5
+    ifconfig ${tap} destroy
+    sysrc cloned_interfaces-=${tap}
+    sed -i '' 's/ addm ${tap}//g' /etc/rc.conf
+    sed -i '' 's/service ${name} start | sleep 5//g' /usr/local/etc/rc.d/bhyve
+    sed -i '' '/^$/d' /usr/local/etc/rc.d/bhyve
+    zfs destroy -r zroot/VMs/${name}
+    rm /usr/local/etc/rc.d/${name}
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf 'load_rc_config ${name}
+
+  run_rc_command "$1"\n' | sed -e 's/^[ \t]*//' >> /usr/local/etc/rc.d/${name}
+
+  # Add the VM to /usr/local/etc/rc.d/bhyve for autostart
+  sed -i '' -e "10s/^/service ${name} start | sleep 5\n/g"  /usr/local/etc/rc.d/bhyve
+}
+
+# The Dialog Menu
+while true; do
+  menu=`dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+          --stdout --nocancel --menu "Select your OS:" 0 0 0 \
+          1 "FreeBSD 12.2" 2 "OpenBSD 6.8" 3 "Fedora 33 Server" 4 "CentOS 8 (2004)" 5 "openSUSE Tumbleweed" \
+          6 "openSUSE MicroOS" 7 "Windows 10" 8 "Setup (ZFS)" 9 "Clean (ZFS)" 10 "Exit"`
+  if [ ${menu} -eq 1 ]; then
+    while true; do
+      if dialog --title "FreeBSD" --stdout --nocancel --inputbox "The VM name:" 0 0 FreeBSD \
+          --and-widget --title "FreeBSD" --nocancel --inputbox "RAM (GB):" 0 0 8 \
+          --and-widget --title "FreeBSD" --nocancel --inputbox "CPUs:" 0 0 2 \
+          --and-widget --title "FreeBSD" --nocancel --inputbox "Disk size (GB):" 0 0 16 > output.txt; then
+      name=$(cat output.txt | awk '{print $1}')
+      ram=$(cat output.txt | awk '{print $2}')
+      cpu=$(cat output.txt | awk '{print $3}')
+      disk=$(cat output.txt | awk '{print $4}')
+      VMs="/zroot/VMs"
+      FreeBSD_ISO="/zroot/VMs/ISOs/FreeBSD-12.2-RELEASE-amd64-disc1.iso"
+      if [ ! -d "${VMs}" ]; then
+        dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "/zroot/VMs directory does not exist, please run Setup first" 5 65
+        rm output.txt
+        exit
+      elif [ ! -f "${FreeBSD_ISO}" ]; then
+        #pkg install ca_root_nss
+        fetch -o /zroot/VMs/ISOs https://download.freebsd.org/ftp/releases/amd64/amd64/ISO-IMAGES/12.2/FreeBSD-12.2-RELEASE-amd64-disc1.iso
+      elif [ -f "/usr/local/etc/rc.d/${name}" ]; then
+      dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "The VM ${name} already exists, please choose another name" 5 65
+        break;
+      fi
+      FreeBSD > /dev/null 2>&1
+      dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "The VM ${name} has been created" 0 0
+        rm output.txt
+      else
+        rm output.txt
+        break;
+      fi
+    done
+  elif [ ${menu} -eq 2 ]; then
+    while true; do
+      if dialog --title "OpenBSD" --stdout --nocancel --inputbox "The VM name:" 0 0 OpenBSD \
+          --and-widget --title "OpenBSD" --nocancel --inputbox "RAM (GB):" 0 0 4 \
+          --and-widget --title "OpenBSD" --nocancel --inputbox "CPUs:" 0 0 2 \
+          --and-widget --title "OpenBSD" --nocancel --inputbox "Disk size (GB):" 0 0 16 > output.txt; then
+      name=$(cat output.txt | awk '{print $1}')
+      ram=$(cat output.txt | awk '{print $2}')
+      cpu=$(cat output.txt | awk '{print $3}')
+      disk=$(cat output.txt | awk '{print $4}')
+      VMs="/zroot/VMs"
+      OpenBSD_ISO="/zroot/VMs/ISOs/install68.img"
+      if [ ! -d "${VMs}" ]; then
+        dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "/zroot/VMs directory does not exist, please run Setup first" 5 65
+        rm output.txt
+        exit
+      elif [ ! -f "${OpenBSD_ISO}" ]; then
+        echo "OpenBSD 6.8 image does not exist, let's download it."
+        #pkg install ca_root_nss
+        fetch -o /zroot/VMs/ISOs https://cdn.openbsd.org/pub/OpenBSD/6.8/amd64/install68.img
+      elif [ -f "/usr/local/etc/rc.d/${name}" ]; then
+      dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "The VM ${name} already exists, please choose another name" 5 65
+        break;
+      fi
+      OpenBSD > /dev/null 2>&1
+      dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "The VM ${name} has been created" 0 0
+        rm output.txt
+      else
+        rm output.txt
+        break;
+      fi
+    done
+  elif [ ${menu} -eq 3 ]; then
+    while true; do
+      if dialog --title "Fedora" --stdout --nocancel --inputbox "The VM name:" 0 0 Fedora \
+          --and-widget --title "Fedora" --nocancel --inputbox "RAM (GB):" 0 0 4 \
+          --and-widget --title "Fedora" --nocancel --inputbox "CPUs:" 0 0 2 \
+          --and-widget --title "Fedora" --nocancel --inputbox "Disk size (GB):" 0 0 32 > output.txt; then
+      name=$(cat output.txt | awk '{print $1}')
+      ram=$(cat output.txt | awk '{print $2}')
+      cpu=$(cat output.txt | awk '{print $3}')
+      disk=$(cat output.txt | awk '{print $4}')
+      VMs="/zroot/VMs"
+      Fedora_ISO="/zroot/VMs/ISOs/Fedora-Server-dvd-x86_64-33-1.2.iso"
+      if [ ! -d "${VMs}" ]; then
+        dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "/zroot/VMs directory does not exist, please run Setup first" 5 65
+        rm output.txt
+        exit
+      elif [ ! -f "${Fedora_ISO}" ]; then
+        echo "Fedora 33 Server ISO image does not exist, let's download it."
+        #pkg install ca_root_nss
+        fetch -o /zroot/VMs/ISOs https://download.fedoraproject.org/pub/fedora/linux/releases/33/Server/x86_64/iso/Fedora-Server-dvd-x86_64-33-1.2.iso
+      elif [ -f "/usr/local/etc/rc.d/${name}" ]; then
+      dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "The VM ${name} already exists, please choose another name" 5 65
+        break;
+      fi
+      Fedora > /dev/null 2>&1
+      dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "The VM ${name} has been created" 0 0
+        rm output.txt
+      else
+        rm output.txt
+        break;
+      fi
+    done
+  elif [ ${menu} -eq 4 ]; then
+    while true; do
+      if dialog --title "CentOS" --stdout --nocancel --inputbox "The VM name:" 0 0 CentOS \
+          --and-widget --title "CentOS" --nocancel --inputbox "RAM (GB):" 0 0 4 \
+          --and-widget --title "CentOS" --nocancel --inputbox "CPUs:" 0 0 2 \
+          --and-widget --title "CentOS" --nocancel --inputbox "Disk size (GB):" 0 0 32 > output.txt; then
+      name=$(cat output.txt | awk '{print $1}')
+      ram=$(cat output.txt | awk '{print $2}')
+      cpu=$(cat output.txt | awk '{print $3}')
+      disk=$(cat output.txt | awk '{print $4}')
+      VMs="/zroot/VMs"
+      CentOS_ISO="/zroot/VMs/ISOs/CentOS-8.2.2004-x86_64-dvd1.iso"
+      if [ ! -d "${VMs}" ]; then
+        dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "/zroot/VMs directory does not exist, please run Setup first" 5 65
+        rm output.txt
+        exit
+      elif [ ! -f "${CentOS_ISO}" ]; then
+        echo "CentOS 8.2.2004 ISO image does not exist, let's download it."
+        #pkg install ca_root_nss
+        fetch -o /zroot/VMs/ISOs https://mirror.arizona.edu/centos/8.2.2004/isos/x86_64/CentOS-8.2.2004-x86_64-dvd1.iso
+      elif [ -f "/usr/local/etc/rc.d/${name}" ]; then
+      dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "The VM ${name} already exists, please choose another name" 5 65
+        break;
+      fi
+      CentOS > /dev/null 2>&1
+      dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "The VM ${name} has been created" 0 0
+        rm output.txt
+      else
+        rm output.txt
+        break;
+      fi
+    done
+  elif [ ${menu} -eq 5 ]; then
+    while true; do
+      if dialog --title "openSUSE" --stdout --nocancel --inputbox "The VM name:" 0 0 openSUSE \
+          --and-widget --title "openSUSE" --nocancel --inputbox "RAM (GB):" 0 0 4 \
+          --and-widget --title "openSUSE" --nocancel --inputbox "CPUs:" 0 0 2 \
+          --and-widget --title "openSUSE" --nocancel --inputbox "Disk size (GB):" 0 0 32 > output.txt; then
+      name=$(cat output.txt | awk '{print $1}')
+      ram=$(cat output.txt | awk '{print $2}')
+      cpu=$(cat output.txt | awk '{print $3}')
+      disk=$(cat output.txt | awk '{print $4}')
+      VMs="/zroot/VMs"
+      openSUSE_ISO="/zroot/VMs/ISOs/openSUSE-Tumbleweed-DVD-x86_64-Current.iso"
+      if [ ! -d "${VMs}" ]; then
+        dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "/zroot/VMs directory does not exist, please run Setup first" 5 65
+        rm output.txt
+        exit
+      elif [ ! -f "${openSUSE_ISO}" ]; then
+        echo "openSUSE Tumbleweed ISO image does not exist, let's download it."
+        #pkg install ca_root_nss
+        fetch -o /zroot/VMs/ISOs https://download.opensuse.org/tumbleweed/iso/openSUSE-Tumbleweed-DVD-x86_64-Current.iso
+      elif [ -f "/usr/local/etc/rc.d/${name}" ]; then
+      dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "The VM ${name} already exists, please choose another name" 5 65
+        break;
+      fi
+      openSUSE > /dev/null 2>&1
+      dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "The VM ${name} has been created" 0 0
+        rm output.txt
+      else
+        rm output.txt
+        break;
+      fi
+    done
+  
+  elif [ ${menu} -eq 6 ]; then
+    while true; do
+      if dialog --title "MicroOS" --stdout --nocancel --inputbox "The VM name:" 0 0 MicroOS \
+          --and-widget --title "MicroOS" --nocancel --inputbox "RAM (GB):" 0 0 8 \
+          --and-widget --title "MicroOS" --nocancel --inputbox "CPUs:" 0 0 2 \
+          --and-widget --title "MicroOS" --nocancel --inputbox "Disk size (GB):" 0 0 32 > output.txt; then
+      name=$(cat output.txt | awk '{print $1}')
+      ram=$(cat output.txt | awk '{print $2}')
+      cpu=$(cat output.txt | awk '{print $3}')
+      disk=$(cat output.txt | awk '{print $4}')
+      VMs="/zroot/VMs"
+      MicroOS_ISO="/zroot/VMs/ISOs/openSUSE-MicroOS-DVD-x86_64-Current.iso"
+      if [ ! -d "${VMs}" ]; then
+        dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "/zroot/VMs directory does not exist, please run Setup first" 5 65
+        rm output.txt
+        exit
+      elif [ ! -f "${MicroOS_ISO}" ]; then
+        echo "openSUSE MicroOS ISO image does not exist, let's download it."
+        #pkg install ca_root_nss
+        fetch -o /zroot/VMs/ISOs https://download.opensuse.org/tumbleweed/iso/openSUSE-MicroOS-DVD-x86_64-Current.iso
+      elif [ -f "/usr/local/etc/rc.d/${name}" ]; then
+      dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "The VM ${name} already exists, please choose another name" 5 65
+        break;
+      fi
+      MicroOS > /dev/null 2>&1
+      dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "The VM ${name} has been created" 0 0
+        rm output.txt
+      else
+        rm output.txt
+        break;
+      fi
+    done
+  elif [ ${menu} -eq 7 ]; then
+    while true; do
+      if dialog --title "Windows" --backtitle "bhyve, the BSD hypervisor" \
+          --no-label "No" --yes-label "Yes" \
+          --yesno "Did you copy Windows ISO image to /zroot/VMs/ISOs/Win10_20H2_English_x64.iso" 5 80; then
+      if dialog --title "Windows" --stdout --nocancel --inputbox "The VM name:" 0 0 Windows \
+          --and-widget --title "Windows" --nocancel --inputbox "RAM (GB):" 0 0 16 \
+          --and-widget --title "Windows" --nocancel --inputbox "CPUs:" 0 0 2 \
+          --and-widget --title "Windows" --nocancel --inputbox "Disk size (GB):" 0 0 64 > output.txt; then
+      name=$(cat output.txt | awk '{print $1}')
+      ram=$(cat output.txt | awk '{print $2}')
+      cpu=$(cat output.txt | awk '{print $3}')
+      disk=$(cat output.txt | awk '{print $4}')
+      VMs="/zroot/VMs"
+      Virtio_ISO="/zroot/VMs/ISOs/virtio-win-0.1.185.iso"
+      Windows_ISO="/zroot/VMs/ISOs/Win10_20H2_English_x64.iso"
+      if [ ! -d "${VMs}" ]; then
+        dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "/zroot/VMs directory does not exist, please run Setup first" 5 65
+        rm output.txt
+        exit
+      fi
+      if [ ! -f "${Virtio_ISO}" ]; then
+        #pkg install ca_root_nss
+        fetch -o /zroot/VMs/ISOs https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.185-2/virtio-win-0.1.185.iso
+      fi
+      if [ ! -f "${Windows_ISO}" ]; then
+        dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "Windows ISO image are not exist, please download it & copy it to /zroot/VMs/ISOs/Win10_20H2_English_x64.iso" 5 111
+        rm output.txt
+        exit;
+      elif [ -f "/usr/local/etc/rc.d/${name}" ]; then
+      dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "The VM ${name} already exists, please choose another name" 5 65
+        break;
+      fi
+      Windows > /dev/null 2>&1
+      dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "The VM ${name} has been created" 0 0
+        rm output.txt
+      else
+        rm output.txt
+        break;
+      fi
+      else
+        break;
+      fi
+    done
+  elif [ ${menu} -eq 8 ]; then
+      if dialog --title "Setup" --backtitle "bhyve, the BSD hypervisor" \
+          --no-label "No" --yes-label "Yes" \
+          --yesno "Would you like to proceed?" 5 30; then
+      ISOs="/zroot/VMs/ISOs"
+      efi="./efi.fd"
+      if [ -d "${ISOs}" ]; then
+        dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "bhyve is installed, nothing to do." 5 38
+        exit;
+      elif [ ! -f "${efi}" ]; then
+        dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "efi.fd file doesn't exist, please get it along with bhyve script" 5 68
+        exit;
+      fi
+      Setup > /dev/null 2>&1
+      dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "Enjoy virtualization with bhyve under FreeBSD" 5 49
+      else
+        break;
+      fi
+  elif [ ${menu} -eq 9 ]; then
+      if dialog --title "Clean" --backtitle "bhyve, the BSD hypervisor" \
+          --no-label "No" --yes-label "Yes" \
+          --yesno "Would you like to proceed?" 5 30; then
+      zfs destroy -r zroot/VMs/ISOs
+      rm /zroot/VMs/efi.fd
+      VMs="/zroot/VMs"
+      if [ ! -d "${VMs}" ]; then
+        dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "bhyve isn't installed, nothing to do." 5 41
+        exit
+      elif [ "$(ls -A ${VMs})" ]; then
+         dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "${VMs} is not Empty." 5 49
+         exit
+      elif [ -z "$(ls -A ${VMs})" ]; then # if it's empty
+         zfs destroy -r zroot/VMs
+      fi
+      Clean > /dev/null 2>&1
+      dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "Check /zroot/VMs, if it's not empty you must destroy it manually" 5 68
+      else
+        break;
+      fi
+  elif [ ${menu} -eq 10 ]; then
+    dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+    --no-label "Yes" --yes-label "No" \
+      --yesno "Would you like to exit?" 0 0
+    if [ $? -eq 1 ]; then
+      break;
+    fi
+  fi
+done
