@@ -11,3 +11,16 @@ Enter the project directory:
 ```
 # cd VMs
 ```
+
+Change the script permissions:
+
+```
+# chmod +x bhyve
+```
+
+Run the script:
+
+```
+# ./bhyve
+```
+
