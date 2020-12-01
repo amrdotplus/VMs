@@ -3,11 +3,11 @@
 Clone the repository:
 
 ```
-git clone https://github.com/mirumee/saleor-storefront.git
+# git clone https://github.com/amrplus/VMs.git
 ```
 
 Enter the project directory:
 
 ```
-cd saleor-storefront
+# cd VMs
 ```
