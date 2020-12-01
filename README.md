@@ -1,4 +1,4 @@
-### Installing bhyve script on FreeBSD 12.2
+### Installing bhyve script on FreeBSD 12.2 (ZFS only)
 
 Clone the repository:
 
