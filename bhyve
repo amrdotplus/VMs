@@ -947,7 +947,6 @@ while true; do
         rm output.txt
         exit
       elif [ ! -f "${OpenBSD_ISO}" ]; then
-        echo "OpenBSD 6.8 image does not exist, let's download it."
         #pkg install ca_root_nss
         fetch -o /zroot/VMs/ISOs https://cdn.openbsd.org/pub/OpenBSD/6.8/amd64/install68.img
       elif [ -f "/usr/local/etc/rc.d/${name}" ]; then
@@ -982,7 +981,6 @@ while true; do
         rm output.txt
         exit
       elif [ ! -f "${Fedora_ISO}" ]; then
-        echo "Fedora 33 Server ISO image does not exist, let's download it."
         #pkg install ca_root_nss
         fetch -o /zroot/VMs/ISOs https://download.fedoraproject.org/pub/fedora/linux/releases/33/Server/x86_64/iso/Fedora-Server-dvd-x86_64-33-1.2.iso
       elif [ -f "/usr/local/etc/rc.d/${name}" ]; then
@@ -1017,7 +1015,6 @@ while true; do
         rm output.txt
         exit
       elif [ ! -f "${CentOS_ISO}" ]; then
-        echo "CentOS 8.2.2004 ISO image does not exist, let's download it."
         #pkg install ca_root_nss
         fetch -o /zroot/VMs/ISOs https://mirror.arizona.edu/centos/8.2.2004/isos/x86_64/CentOS-8.2.2004-x86_64-dvd1.iso
       elif [ -f "/usr/local/etc/rc.d/${name}" ]; then
@@ -1052,7 +1049,6 @@ while true; do
         rm output.txt
         exit
       elif [ ! -f "${openSUSE_ISO}" ]; then
-        echo "openSUSE Tumbleweed ISO image does not exist, let's download it."
         #pkg install ca_root_nss
         fetch -o /zroot/VMs/ISOs https://download.opensuse.org/tumbleweed/iso/openSUSE-Tumbleweed-DVD-x86_64-Current.iso
       elif [ -f "/usr/local/etc/rc.d/${name}" ]; then
@@ -1088,7 +1084,6 @@ while true; do
         rm output.txt
         exit
       elif [ ! -f "${MicroOS_ISO}" ]; then
-        echo "openSUSE MicroOS ISO image does not exist, let's download it."
         #pkg install ca_root_nss
         fetch -o /zroot/VMs/ISOs https://download.opensuse.org/tumbleweed/iso/openSUSE-MicroOS-DVD-x86_64-Current.iso
       elif [ -f "/usr/local/etc/rc.d/${name}" ]; then
