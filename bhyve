@@ -315,6 +315,115 @@ OpenBSD()
   sed -i '' -e "10s/^/service ${name} start | sleep 5\n/g"  /usr/local/etc/rc.d/bhyve
 }
 
+Ubuntu()
+{
+  Bridge=$(sysrc cloned_interfaces | awk '{print $2}')
+
+  # Create a VM dataset
+  zfs create zroot/VMs/${name}
+
+  # Create a tap interface and make it member of the bridge
+  tap="$(ifconfig tap create)"
+  ifconfig ${Bridge} addm ${tap}
+
+  # To start tap interface at boot time
+  sysrc cloned_interfaces+="${tap}"
+  sysrc ifconfig_bridge0="$(sysrc ifconfig_bridge0 | awk '{ for(i=2; i<=NF; i++) printf "%s",$i (i==NF?ORS:OFS) }') addm ${tap}"
+
+  # Create ZFS volume
+  zfs create -V${disk}G -o volmode=dev zroot/VMs/${name}/disk0
+
+  Installation()
+  {
+    bhyve -Hw -c ${cpu} -m ${ram}G \
+      -s 0,amd_hostbridge \
+      -s 1,virtio-net,${tap} \
+      -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+      -s 3,ahci-cd,${Ubuntu_ISO} \
+      -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768,vga=off,wait \
+      -s 30,xhci,tablet \
+      -s 31,lpc \
+      -l bootrom,/zroot/VMs/efi.fd \
+      ${name}
+  } 
+  Starting()
+  {
+    bhyve -Hw -c ${cpu} -m ${ram}G \
+      -s 0,amd_hostbridge \
+      -s 1,virtio-net,${tap} \
+      -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+      -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768,vga=off \
+      -s 30,xhci,tablet \
+      -s 31,lpc \
+      -l bootrom,/zroot/VMs/efi.fd \
+      ${name}
+  }   
+  # Start the installation
+  Installation &&
+  # Starting the loop after completion of the installation
+  while true; do
+    Starting;
+    es=$?
+    if [ ${es} -ne 0 ]; then
+    break;
+    fi
+  done > /dev/null 2>&1 &
+  
+  touch /usr/local/etc/rc.d/${name}
+  chmod +x,u=rx /usr/local/etc/rc.d/${name}
+  printf "#!/bin/sh\n. /etc/rc.subr\n" >> /usr/local/etc/rc.d/${name}
+  sed -n '3,16p' ./bhyve >>  /usr/local/etc/rc.d/${name}
+  printf "cpu=${cpu}\nram=${ram}G\ntap=${tap}\nname=${name}\n" >> /usr/local/etc/rc.d/${name}
+  printf 'start_cmd="${name}_start"
+  stop_cmd="${name}_stop"
+  restart_cmd="${name}_restart"
+  delete_cmd="${name}_delete"\n' | sed -e 's/^[ \t]*//' >> /usr/local/etc/rc.d/${name}
+  printf "${name}_start()\n" >> /usr/local/etc/rc.d/${name}
+  echo ' {
+    while true; do
+      bhyve -Hw -c ${cpu} -m ${ram}G \
+        -s 0,hostbridge \
+        -s 1,virtio-net,${tap} \
+        -s 2,virtio-blk,/dev/zvol/zroot/VMs/${name}/disk0 \
+        -s 29,fbuf,tcp=0.0.0.0:${vnc},w=1024,h=768 \
+        -s 30,xhci,tablet \
+        -s 31,lpc \
+        -l bootrom,/zroot/VMs/efi.fd \
+        ${name}
+      es=$?
+      if [ ${es} -ne 0 ]; then
+        break;
+      fi
+    done > /dev/null 2>&1 &
+  }' >> /usr/local/etc/rc.d/${name}
+  printf "${name}_stop()
+  {
+    bhyvectl --vm=${name} --force-poweroff
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf "${name}_restart()
+  {
+    bhyvectl --vm=${name} --force-reset
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf "${name}_delete()
+  {
+    bhyvectl --vm=${name} --destroy
+    sleep 5
+    ifconfig ${tap} destroy
+    sysrc cloned_interfaces-=${tap}
+    sed -i '' 's/ addm ${tap}//g' /etc/rc.conf
+    sed -i '' 's/service ${name} start | sleep 5//g' /usr/local/etc/rc.d/bhyve
+    sed -i '' '/^$/d' /usr/local/etc/rc.d/bhyve
+    zfs destroy -r zroot/VMs/${name}
+    rm /usr/local/etc/rc.d/${name}
+  }\n" >> /usr/local/etc/rc.d/${name}
+  printf 'load_rc_config ${name}
+
+  run_rc_command "$1"\n' | sed -e 's/^[ \t]*//' >> /usr/local/etc/rc.d/${name}
+
+  # Add the VM to /usr/local/etc/rc.d/bhyve for autostart
+  sed -i '' -e "10s/^/service ${name} start | sleep 5\n/g"  /usr/local/etc/rc.d/bhyve
+}
+
 Fedora()
 {
   Bridge=$(sysrc cloned_interfaces | awk '{print $2}')
@@ -893,14 +1002,14 @@ Windows()
 while true; do
   menu=`dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
           --stdout --nocancel --menu "Select your OS:" 0 0 0 \
-          1 "FreeBSD 12.2" 2 "OpenBSD 6.8" 3 "Fedora 33 Server" 4 "CentOS 8 (2004)" 5 "openSUSE Tumbleweed" \
-          6 "openSUSE MicroOS" 7 "Windows 10" 8 "Setup (ZFS)" 9 "Clean (ZFS)" 10 "Exit"`
+          1 "FreeBSD 12.2" 2 "OpenBSD 6.8" 3 "Ubuntu 20.10" 4 "Fedora 33 Server" 5 "CentOS 8 (2011)" \
+          6 "openSUSE Tumbleweed" 7 "openSUSE MicroOS" 8 "Windows 10" 9 "Setup (ZFS)" 10 "Clean (ZFS)" 11 "Exit"`
   if [ ${menu} -eq 1 ]; then
     while true; do
       if dialog --title "FreeBSD" --stdout --nocancel --inputbox "The VM name:" 0 0 FreeBSD \
           --and-widget --title "FreeBSD" --nocancel --inputbox "RAM (GB):" 0 0 8 \
           --and-widget --title "FreeBSD" --nocancel --inputbox "CPUs:" 0 0 2 \
-          --and-widget --title "FreeBSD" --nocancel --inputbox "Disk size (GB):" 0 0 16 > output.txt; then
+          --and-widget --title "FreeBSD" --nocancel --inputbox "Disk size (GB):" 0 0 32 > output.txt; then
       name=$(cat output.txt | awk '{print $1}')
       ram=$(cat output.txt | awk '{print $2}')
       cpu=$(cat output.txt | awk '{print $3}')
@@ -934,7 +1043,7 @@ while true; do
       if dialog --title "OpenBSD" --stdout --nocancel --inputbox "The VM name:" 0 0 OpenBSD \
           --and-widget --title "OpenBSD" --nocancel --inputbox "RAM (GB):" 0 0 4 \
           --and-widget --title "OpenBSD" --nocancel --inputbox "CPUs:" 0 0 2 \
-          --and-widget --title "OpenBSD" --nocancel --inputbox "Disk size (GB):" 0 0 16 > output.txt; then
+          --and-widget --title "OpenBSD" --nocancel --inputbox "Disk size (GB):" 0 0 32 > output.txt; then
       name=$(cat output.txt | awk '{print $1}')
       ram=$(cat output.txt | awk '{print $2}')
       cpu=$(cat output.txt | awk '{print $3}')
@@ -964,6 +1073,40 @@ while true; do
       fi
     done
   elif [ ${menu} -eq 3 ]; then
+    while true; do
+      if dialog --title "Ubuntu" --stdout --nocancel --inputbox "The VM name:" 0 0 Ubuntu \
+          --and-widget --title "Ubuntu" --nocancel --inputbox "RAM (GB):" 0 0 8 \
+          --and-widget --title "Ubuntu" --nocancel --inputbox "CPUs:" 0 0 2 \
+          --and-widget --title "Ubuntu" --nocancel --inputbox "Disk size (GB):" 0 0 32 > output.txt; then
+      name=$(cat output.txt | awk '{print $1}')
+      ram=$(cat output.txt | awk '{print $2}')
+      cpu=$(cat output.txt | awk '{print $3}')
+      disk=$(cat output.txt | awk '{print $4}')
+      VMs="/zroot/VMs"
+      Ubuntu_ISO="/zroot/VMs/ISOs/ubuntu-20.10-desktop-amd64.iso"
+      if [ ! -d "${VMs}" ]; then
+        dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "/zroot/VMs directory does not exist, please run Setup first" 5 65
+        rm output.txt
+        exit
+      elif [ ! -f "${Ubuntu_ISO}" ]; then
+        #pkg install ca_root_nss
+        fetch -o /zroot/VMs/ISOs https://releases.ubuntu.com/20.10/ubuntu-20.10-desktop-amd64.iso
+      elif [ -f "/usr/local/etc/rc.d/${name}" ]; then
+      dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "The VM ${name} already exists, please choose another name" 5 65
+        break;
+      fi
+      Ubuntu > /dev/null 2>&1
+      dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
+        --msgbox "The VM ${name} has been created" 0 0
+        rm output.txt
+      else
+        rm output.txt
+        break;
+      fi
+    done
+  elif [ ${menu} -eq 4 ]; then
     while true; do
       if dialog --title "Fedora" --stdout --nocancel --inputbox "The VM name:" 0 0 Fedora \
           --and-widget --title "Fedora" --nocancel --inputbox "RAM (GB):" 0 0 4 \
@@ -997,7 +1140,7 @@ while true; do
         break;
       fi
     done
-  elif [ ${menu} -eq 4 ]; then
+  elif [ ${menu} -eq 5 ]; then
     while true; do
       if dialog --title "CentOS" --stdout --nocancel --inputbox "The VM name:" 0 0 CentOS \
           --and-widget --title "CentOS" --nocancel --inputbox "RAM (GB):" 0 0 4 \
@@ -1008,7 +1151,7 @@ while true; do
       cpu=$(cat output.txt | awk '{print $3}')
       disk=$(cat output.txt | awk '{print $4}')
       VMs="/zroot/VMs"
-      CentOS_ISO="/zroot/VMs/ISOs/CentOS-8.2.2004-x86_64-dvd1.iso"
+      CentOS_ISO="/zroot/VMs/ISOs/CentOS-8.3.2011-x86_64-dvd1.iso"
       if [ ! -d "${VMs}" ]; then
         dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
         --msgbox "/zroot/VMs directory does not exist, please run Setup first" 5 65
@@ -1016,7 +1159,7 @@ while true; do
         exit
       elif [ ! -f "${CentOS_ISO}" ]; then
         #pkg install ca_root_nss
-        fetch -o /zroot/VMs/ISOs https://mirror.arizona.edu/centos/8.2.2004/isos/x86_64/CentOS-8.2.2004-x86_64-dvd1.iso
+        fetch -o /zroot/VMs/ISOs https://mirror.arizona.edu/centos/8.3.2011/isos/x86_64/CentOS-8.3.2011-x86_64-dvd1.iso
       elif [ -f "/usr/local/etc/rc.d/${name}" ]; then
       dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
         --msgbox "The VM ${name} already exists, please choose another name" 5 65
@@ -1031,7 +1174,7 @@ while true; do
         break;
       fi
     done
-  elif [ ${menu} -eq 5 ]; then
+  elif [ ${menu} -eq 6 ]; then
     while true; do
       if dialog --title "openSUSE" --stdout --nocancel --inputbox "The VM name:" 0 0 openSUSE \
           --and-widget --title "openSUSE" --nocancel --inputbox "RAM (GB):" 0 0 4 \
@@ -1066,7 +1209,7 @@ while true; do
       fi
     done
   
-  elif [ ${menu} -eq 6 ]; then
+  elif [ ${menu} -eq 7 ]; then
     while true; do
       if dialog --title "MicroOS" --stdout --nocancel --inputbox "The VM name:" 0 0 MicroOS \
           --and-widget --title "MicroOS" --nocancel --inputbox "RAM (GB):" 0 0 8 \
@@ -1100,7 +1243,7 @@ while true; do
         break;
       fi
     done
-  elif [ ${menu} -eq 7 ]; then
+  elif [ ${menu} -eq 8 ]; then
     while true; do
       if dialog --title "Windows" --backtitle "bhyve, the BSD hypervisor" \
           --no-label "No" --yes-label "Yes" \
@@ -1148,7 +1291,7 @@ while true; do
         break;
       fi
     done
-  elif [ ${menu} -eq 8 ]; then
+  elif [ ${menu} -eq 9 ]; then
       if dialog --title "Setup" --backtitle "bhyve, the BSD hypervisor" \
           --no-label "No" --yes-label "Yes" \
           --yesno "Would you like to proceed?" 5 30; then
@@ -1169,7 +1312,7 @@ while true; do
       else
         break;
       fi
-  elif [ ${menu} -eq 9 ]; then
+  elif [ ${menu} -eq 10 ]; then
       if dialog --title "Clean" --backtitle "bhyve, the BSD hypervisor" \
           --no-label "No" --yes-label "Yes" \
           --yesno "Would you like to proceed?" 5 30; then
@@ -1193,7 +1336,7 @@ while true; do
       else
         break;
       fi
-  elif [ ${menu} -eq 10 ]; then
+  elif [ ${menu} -eq 11 ]; then
     dialog --title "bhyve" --backtitle "bhyve, the BSD hypervisor" \
     --no-label "Yes" --yes-label "No" \
       --yesno "Would you like to exit?" 0 0
