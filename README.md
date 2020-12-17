@@ -3,7 +3,7 @@
 Clone the repository:
 
 ```
-# git clone https://github.com/amrplus/VMs.git
+# git clone https://github.com/amrdotplus/VMs.git
 ```
 
 Enter the project directory:
